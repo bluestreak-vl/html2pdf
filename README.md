@@ -1,4 +1,4 @@
-# html2pdf
+# HTML2PDF
 A C# console application that converts individual pages from PDF2HTML output to separate PDF files using PuppeteerSharp.
 
 Basically, it creates PDFs from the output of https://github.com/shebinleo/pdf2html
