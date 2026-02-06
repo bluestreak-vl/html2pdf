@@ -11,8 +11,19 @@ using System.Diagnostics;
 
 class Program
 {
+
+
+    // To test with arguments in VS Code run from the terminal:  
+    // dotnet run -- "C:\Path\To\HtmlRootFolder" 1 10
+
+    private static bool _firstRun = true;
+    private static decimal _dpi = 150.0M;
+
     static async Task Main(string[] args)
     {
+        //For debugging
+        //args = new string[] { @"D:\temp\ebooks\HTML_EBook", "6", "7" };
+
         // Define page range (edit for testing)
         int intStartPage = 1; // inclusive, set to 1 for first page or 0 to convert all
         int intEndPage = 0;   // inclusive, set to N for last page or 0 to convert all
@@ -41,7 +52,7 @@ class Program
             strHtmlRootFolder = args[0];
             if (!File.Exists(Path.Combine(strHtmlRootFolder, "contents.db")))
             {
-                Console.WriteLine($"The specified directory does not contain contents.db: {strHtmlRootFolder}");
+                Console.WriteLine($"The specified directory does not contain the contents.db: {strHtmlRootFolder}");
                 return;
             }
         }
@@ -70,36 +81,12 @@ class Program
             return;
         }
 
-        // 1. Read the database
-        using var db = new SqliteConnection($"Data Source={contentsDbPath}");
-        db.Open();
-
-        var pagesCmd = db.CreateCommand();
-        pagesCmd.CommandText = "SELECT PID, Title, PageNum FROM Pages ORDER BY PageNum ASC";
-        if (intStartPage > 0 && intEndPage > 0)
-        {
-            pagesCmd.CommandText = pagesCmd.CommandText.Replace("ORDER BY", "WHERE PageNum BETWEEN $startPage AND $endPage ORDER BY");
-            pagesCmd.Parameters.AddWithValue("$startPage", intStartPage);
-            pagesCmd.Parameters.AddWithValue("$endPage", intEndPage);
-        }
-        else if (intEndPage > 0)
-        {
-            pagesCmd.CommandText = pagesCmd.CommandText.Replace("ORDER BY", "WHERE PageNum <= $endPage ORDER BY");
-            pagesCmd.Parameters.AddWithValue("$endPage", intEndPage);
-        }
-        else if (intStartPage > 1)
-        {
-            pagesCmd.CommandText = pagesCmd.CommandText.Replace("ORDER BY", "WHERE PageNum >= $startPage ORDER BY");
-            pagesCmd.Parameters.AddWithValue("$startPage", intStartPage);
-        }
-
-        //Console.WriteLine($"Executing SQL: {pagesCmd.CommandText}");
-
-        using var reader = pagesCmd.ExecuteReader();
+        
+        SqliteDataReader rdrPages = await GetContentsDB(contentsDbPath, intStartPage, intEndPage);
 
         // Prepare Puppeteer
-        var browserFetcher = new BrowserFetcher();
-        var tskDownload = browserFetcher.DownloadAsync();
+        var objBrowserFetcher = new BrowserFetcher();
+        var tskDownload = objBrowserFetcher.DownloadAsync();
         // Wait up to 2 seconds for download. If the task is still running, notify user Chrome is being downloaded.
         if (await Task.WhenAny(tskDownload, Task.Delay(2000)) != tskDownload)
         {
@@ -107,22 +94,21 @@ class Program
             await tskDownload;
         }
 
-        using var browser = await Puppeteer.LaunchAsync(new LaunchOptions { Headless = true });
+        using var objBrowser = await Puppeteer.LaunchAsync(new LaunchOptions { Headless = true });
 
         Console.WriteLine("Starting conversion...");
         
         int intTickCountStart = System.Environment.TickCount;
         int intPageCount = 0;
-
         Stopwatch objStopwatch = new Stopwatch();
         objStopwatch.Start();
 
         // For each page in DB
-        while (reader.Read())
+        while (rdrPages.Read())
         {
-            var pid = reader.GetString(0);     // HTML file name
-            var title = reader.GetString(1);   // Title
-            var pageNum = reader.GetInt32(2);  // PageNum
+            var pid = rdrPages.GetString(0);     // HTML file name
+            var title = rdrPages.GetString(1);   // Title
+            var pageNum = rdrPages.GetInt32(2);  // PageNum
 
             // Build HTML file path
             var htmlFilePath = Path.Combine(strHtmlRootFolder, $"{pid}.html");
@@ -146,7 +132,7 @@ class Program
 
             var fileUrl = new Uri(htmlFilePath).AbsoluteUri;
 
-            using var pageLoader = await browser.NewPageAsync();
+            using var pageLoader = await objBrowser.NewPageAsync();
             await pageLoader.GoToAsync(fileUrl, WaitUntilNavigation.Networkidle0);
 
             // Get iframe if present
@@ -173,52 +159,33 @@ class Program
             IPage pagePdf = pageLoader;
             if (iframePdf != null && !string.IsNullOrEmpty(iframePdf.Url))
             {
-                pagePdf = await browser.NewPageAsync();
+                pagePdf = await objBrowser.NewPageAsync();
                 await pagePdf.GoToAsync(iframePdf.Url, WaitUntilNavigation.Networkidle0);
                 await Task.Delay(250);
             }
 
-            // the page div is named pf[n], where n is a page number within the "chapter". 'n' is a hexidecimal number starting from 1.
-            // eg. pf1, pf2 ..., pf9, pfa, pfb ... , pfd, pf10, pf11, etc.
-            // Look for a div element with id that starts with "pf"
+            await ConvertPageToPdf(pagePdf, strOutputPdf);
 
-            var el = await pagePdf.QuerySelectorAsync("div[id^='pf']");
-            if (el == null)
+            if (_firstRun && _dpi > 96)
             {
-                Console.WriteLine("  Skipped: #pf element not found.");
-                Debugger.Break();
-                continue;
+                Console.WriteLine("  Checking page count of first converted PDF to verify correct DPI setting...");
+                await Task.Delay(250); 
+                //check if converted PDF file has two pages. If so lower the dpi to 96 and run again
+
+                using var pdfDocTest = PdfSharp.Pdf.IO.PdfReader.Open(strOutputPdf, PdfSharp.Pdf.IO.PdfDocumentOpenMode.Import);
+                if (pdfDocTest.PageCount > 1)   
+                {
+                    Console.WriteLine("  Notice: Converted PDF has more than one page. Adjusting DPI to 96 and reconverting.");
+                    _dpi = 96.0M;
+                    await ConvertPageToPdf(pagePdf, strOutputPdf);
+                }
+
+                _firstRun = false;
             }
-
-            var box = await el.BoundingBoxAsync();
-            if (box == null)
-            {
-                Console.WriteLine("  Skipped: Could not get bounding box.");
-                continue;
-            }
-
-            // You can adjust DPI here if needed
-            const decimal dpi = 150.0M;
-            var widthInInches = (box.Width / dpi).ToString("0.####", CultureInfo.InvariantCulture) + "in";
-            var heightInInches = (box.Height / dpi).ToString("0.####", CultureInfo.InvariantCulture) + "in";
-
-            await pagePdf.PdfAsync(strOutputPdf, new PdfOptions
-            {
-                PrintBackground = true,
-                Width = widthInInches,
-                Height = heightInInches,
-                MarginOptions = new PuppeteerSharp.Media.MarginOptions { Top = "0", Bottom = "0", Left = "0", Right = "0" },
-                PreferCSSPageSize = false
-            });
-
-            // Remove PDF title
-            using var pdfDoc = PdfSharp.Pdf.IO.PdfReader.Open(strOutputPdf, PdfSharp.Pdf.IO.PdfDocumentOpenMode.Modify);
-            pdfDoc.Info.Title = "";
-            pdfDoc.Save(strOutputPdf);
-            pdfDoc.Close();
-
-            Console.WriteLine($"  Done: {Path.GetFileName(strOutputPdf)} [{box.Width}x{box.Height}px; {widthInInches} x {heightInInches}]");
+            else
+                _firstRun = false;
             
+
             // Clean up page if opened as a new tab
             if (pagePdf != pageLoader)
                 await pagePdf.CloseAsync();
@@ -228,14 +195,104 @@ class Program
             intPageCount++;
             if (objStopwatch.Elapsed.TotalMilliseconds >= 10000)
             {
-                objStopwatch.Reset();
-                objStopwatch.Start();
+                objStopwatch.Restart();
                 GC.Collect();
 
                 Console.WriteLine($"* * * Converted {intPageCount} pages... * * *");
             }
         }
+        
+        rdrPages.Close();
+        rdrPages.Dispose();
+
         Console.WriteLine("All Done");
         Console.WriteLine($"Total time elapsed: {(System.Environment.TickCount - intTickCountStart) / 1000} seconds for {intPageCount} pages.");
+    }
+
+    public static async Task<SqliteDataReader> GetContentsDB(string contentsDbPath, int startPage, int endPage)
+    {
+        // Read the database
+        SqliteConnection db = new SqliteConnection($"Data Source={contentsDbPath}");
+        db.Open();
+
+        var cmdPages = db.CreateCommand();
+        cmdPages.CommandText = "SELECT PID, Title, PageNum FROM Pages ORDER BY PageNum ASC";
+        if (startPage > 0 && endPage > 0)
+        {
+            cmdPages.CommandText = cmdPages.CommandText.Replace("ORDER BY", "WHERE PageNum BETWEEN $startPage AND $endPage ORDER BY");
+            cmdPages.Parameters.AddWithValue("$startPage", startPage);
+            cmdPages.Parameters.AddWithValue("$endPage", endPage);
+        }
+        else if (endPage > 0)
+        {
+            cmdPages.CommandText = cmdPages.CommandText.Replace("ORDER BY", "WHERE PageNum <= $endPage ORDER BY");
+            cmdPages.Parameters.AddWithValue("$endPage", endPage);
+        }
+        else if (startPage > 1)
+        {
+            cmdPages.CommandText = cmdPages.CommandText.Replace("ORDER BY", "WHERE PageNum >= $startPage ORDER BY");
+            cmdPages.Parameters.AddWithValue("$startPage", startPage);
+        }
+
+        //Console.WriteLine($"Executing SQL: {pagesCmd.CommandText}");
+
+        return cmdPages.ExecuteReader();
+    }
+
+    // Move PDF conversion code to seperate method
+    public static async Task ConvertPageToPdf(IPage pagePdf, string outputPath)
+    {
+
+        // the page div is named pf[n], where n is a page number within the "chapter". 'n' is a hexidecimal number starting from 1.
+        // eg. pf1, pf2 ..., pf9, pfa, pfb ... , pfd, pf10, pf11, etc.
+        // Look for a div element with id that starts with "pf"
+
+        var el = await pagePdf.QuerySelectorAsync("div[id^='pf']");
+        if (el == null)
+        {
+            Console.WriteLine("  Error: #pf element not found.");
+            Debugger.Break();
+            return;
+        }
+
+        var box = await el.BoundingBoxAsync();
+        if (box == null)
+        {
+            Console.WriteLine("  Error: Could not get bounding box.");
+            Debugger.Break();
+            return;
+        }
+
+        // You can adjust DPI here if needed
+        
+        var widthInInches = (box.Width / _dpi).ToString("0.####", CultureInfo.InvariantCulture) + "in";
+        var heightInInches = (box.Height / _dpi).ToString("0.####", CultureInfo.InvariantCulture) + "in";
+
+        try
+        {
+            await pagePdf.PdfAsync(outputPath, new PdfOptions
+            {
+                PrintBackground = true,
+                Width = widthInInches,
+                Height = heightInInches,
+                MarginOptions = new PuppeteerSharp.Media.MarginOptions { Top = "0", Bottom = "0", Left = "0", Right = "0" },
+                PreferCSSPageSize = false
+            });
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  Error during PDF conversion: {ex.Message}");
+            Debugger.Break();
+            return;
+        }
+
+        // Remove PDF title
+        using var pdfDoc = PdfSharp.Pdf.IO.PdfReader.Open(outputPath, PdfSharp.Pdf.IO.PdfDocumentOpenMode.Modify);
+        pdfDoc.Info.Title = "";
+        pdfDoc.Save(outputPath);
+        pdfDoc.Close();
+        pdfDoc.Dispose();
+
+        Console.WriteLine($"  Done: {Path.GetFileName(outputPath)} [{box.Width}x{box.Height}px; {widthInInches} x {heightInInches}]");
     }
 }
